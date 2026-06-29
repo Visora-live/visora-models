@@ -1,0 +1,37 @@
+# Model weights — download separately and place in their directories
+*.pt
+*.keras
+*.h5
+*.onnx
+*.pth
+*.weights
+
+# User face gallery — personal data, populated at enrollment time
+package_face_webcam/custom_gallery/*/
+
+# Identity database — generated at runtime
+package_face_webcam/data/custom_identities.csv
+
+# Reports — generated at runtime
+package_face_webcam/reports/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Env files
+.env
+.env.*
+
+# Runtime snapshots
+*_snapshots/
+snapshots/
+
+# OS
+.DS_Store
+Thumbs.db
