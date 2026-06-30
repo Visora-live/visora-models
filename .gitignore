@@ -1,10 +1,13 @@
-# Model weights — download separately and place in their directories
-*.pt
+# Model weights — large files excluded by default; tracked weights below are exceptions
 *.keras
 *.h5
 *.onnx
 *.pth
 *.weights
+*.pt
+# Allow production weights
+!package_weapon_webcam/yolov8n-pose.pt
+!package_weapon_webcam/workspace_modelos/content-detector/weights/best.pt
 
 # User face gallery — personal data, populated at enrollment time
 package_face_webcam/custom_gallery/*/
@@ -12,8 +15,12 @@ package_face_webcam/custom_gallery/*/
 # Identity database — generated at runtime
 package_face_webcam/data/custom_identities.csv
 
-# Reports — generated at runtime
-package_face_webcam/reports/
+# Reports — runtime artifacts except face gallery centroids (needed for deployment)
+# Note: cannot use directory-level ignore + negate child; use glob instead
+package_face_webcam/reports/*
+!package_face_webcam/reports/custom_face_enrollment
+package_face_webcam/reports/custom_face_enrollment/*
+!package_face_webcam/reports/custom_face_enrollment/custom_gallery_centroids.csv
 
 # Python
 __pycache__/

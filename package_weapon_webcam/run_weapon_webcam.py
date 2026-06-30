@@ -278,10 +278,12 @@ def _with_token_refresh(token_ref: List[str], fn) -> None:
 def post_weapon_initial(
     token_ref: List[str], tienda_id: Optional[int]
 ) -> Tuple[Optional[int], Optional[int]]:
-    """POST event + alert immediately on first weapon confirmation. Returns (event_id, alert_id)."""
-    result: List[Tuple[Optional[int], Optional[int]]] = [(None, None)]
+    """POST event + alert on first weapon confirmation. Returns (event_id, alert_id).
+    Event and alert are created in separate calls so a failed alert does not orphan the event."""
+    event_id: List[Optional[int]] = [None]
+    alert_id: List[Optional[int]] = [None]
 
-    def _post(tok: str) -> None:
+    def _create_event(tok: str) -> None:
         headers = {"Authorization": f"Bearer {tok}"}
         ev = requests.post(
             f"{API_BASE}/events",
@@ -290,34 +292,36 @@ def post_weapon_initial(
                 "severidad": "alta",
                 "estado": "abierto",
                 "camara_id": CAMERA_ID,
-                "comentario": "Arma detectada — analizando incidente...",
+                "comentario": "Objeto crítico detectado — analizando incidente...",
             },
             headers=headers,
             timeout=10,
         )
         ev.raise_for_status()
-        event_id = ev.json().get("id")
+        event_id[0] = ev.json().get("id")
 
+    def _create_alert(tok: str) -> None:
+        headers = {"Authorization": f"Bearer {tok}"}
         alert_payload: Dict = {
-            "titulo": "Arma detectada por cámara",
-            "descripcion": "Incidente en análisis — se actualizará con datos del infractor.",
+            "titulo": "Objeto crítico detectado",
+            "descripcion": "Objeto crítico en análisis — se actualizará con datos del infractor.",
             "tipo": "weapon_detection",
             "severidad": "alta",
             "estado": "abierta",
             "camara_id": CAMERA_ID,
-            "evento_id": event_id,
+            "evento_id": event_id[0],
         }
         if tienda_id is not None:
             alert_payload["tienda_id"] = tienda_id
-
         al = requests.post(f"{API_BASE}/alerts", json=alert_payload, headers=headers, timeout=10)
         al.raise_for_status()
-        alert_id = al.json().get("id")
-        result[0] = (event_id, alert_id)
-        LOG.info("ALERTA #%s lanzada — evento #%s (cámara %d)", alert_id, event_id, CAMERA_ID)
+        alert_id[0] = al.json().get("id")
 
-    _with_token_refresh(token_ref, _post)
-    return result[0]
+    _with_token_refresh(token_ref, _create_event)
+    if event_id[0] is not None:
+        _with_token_refresh(token_ref, _create_alert)
+        LOG.info("ALERTA #%s lanzada — evento #%s (cámara %d)", alert_id[0], event_id[0], CAMERA_ID)
+    return event_id[0], alert_id[0]
 
 
 def patch_weapon_result(
@@ -336,22 +340,22 @@ def patch_weapon_result(
         full            = " ".join(full_parts)
         dni             = identity["dni"]
         event_comment = (
-            f"Arma detectada — confianza: {confidence:.0%} | "
+            f"Objeto crítico detectado — confianza: {confidence:.0%} | "
             f"Portador identificado: {full} (DNI: {dni}) | "
             f"Confianza rostro: {identity['face_score']:.0%}"
         )
         alert_desc = (
-            f"Arma detectada en cámara {CAMERA_ID} | "
+            f"Objeto crítico en cámara {CAMERA_ID} | "
             f"Portador: {full} (DNI: {dni}) | "
             f"Confianza arma: {confidence:.0%}"
         )
     else:
         event_comment = (
-            f"Arma detectada — confianza: {confidence:.0%} | "
+            f"Objeto crítico detectado — confianza: {confidence:.0%} | "
             f"Lo sentimos, no se pudo identificar al infractor"
         )
         alert_desc = (
-            f"Arma detectada en cámara {CAMERA_ID} — confianza: {confidence:.0%} | "
+            f"Objeto crítico en cámara {CAMERA_ID} — confianza: {confidence:.0%} | "
             f"Lo sentimos, no se pudo identificar al infractor"
         )
 
@@ -569,6 +573,33 @@ def draw_confirmed_detection(frame: np.ndarray, detection: Dict[str, object]) ->
 
 # ── Frame quality & preprocessing ────────────────────────────────────────────
 
+
+def _upload_event_frame(token_ref, event_id, frame) -> None:
+    if event_id is None:
+        return
+    def _do(tok: str) -> None:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return
+        img_bytes = buf.tobytes()
+        headers = {"Authorization": f"Bearer {tok}"}
+        # Upload to event-images (linked to specific event for history)
+        files = {"file": ("detection.jpg", img_bytes, "image/jpeg")}
+        data = {"evento_id": str(event_id), "es_frame_representativo": "true"}
+        resp = requests.post(f"{API_BASE}/event-images/upload",
+                             headers=headers, files=files, data=data, timeout=15)
+        resp.raise_for_status()
+        LOG.info("Frame subido — event_image #%s para evento #%s", resp.json().get("id"), event_id)
+        # Also upload as latest snapshot so frontend /detect/snapshot endpoint works
+        files2 = {"file": ("detection.jpg", img_bytes, "image/jpeg")}
+        requests.post(f"{API_BASE}/cameras/{CAMERA_ID}/detect/snapshot",
+                      headers=headers, files=files2, timeout=15)
+    try:
+        _with_token_refresh(token_ref, _do)
+    except Exception as exc:
+        LOG.warning("Error subiendo frame: %s", exc)
+
+
 def frame_sharpness(frame: np.ndarray) -> float:
     """Laplacian variance — higher = sharper. Used to skip blurry buffer frames."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -734,6 +765,14 @@ def main() -> None:
     while True:
         ok, frame_bgr = cap.read()
         if not ok or frame_bgr is None:
+            # Flush orphaned buffer if stream died during capture window
+            if _buffering and _pending_event_id and (time.time() - _buf_start) >= CAPTURE_WINDOW + 5:
+                _buffering = False
+                LOG.warning("Stream caido durante ventana de captura — cerrando evento #%s sin imagen", _pending_event_id)
+                patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id,
+                                    _last_confirmed_conf or 0.0, None)
+                _pending_event_id = None
+                _pending_alert_id = None
             time.sleep(0.03)
             continue
 
@@ -855,75 +894,73 @@ def main() -> None:
                 if _buffering and sharpness >= BLUR_MIN_VAR:
                     _buf.append((frame_bgr.copy(), confidence, sharpness, weapon_box))
 
-                # Process buffer when window closes — update alert/event with identity + best frame
-                if _buffering and now - _buf_start >= CAPTURE_WINDOW:
-                    _buffering = False
-                    # Use buffer frames if available; fall back to last confirmed frame
-                    if _buf:
-                        max_conf  = max(e[1] for e in _buf) or 1.0
-                        max_sharp = max(e[2] for e in _buf) or 1.0
-                        ranked = sorted(
-                            _buf,
-                            key=lambda e: 0.7 * (e[1] / max_conf) + 0.3 * (e[2] / max_sharp),
-                            reverse=True,
-                        )
-                        top3 = ranked[:3]
-                        best_frame, best_conf, _, best_wbox = top3[0]
-                    elif _last_confirmed_frame is not None:
-                        print("[VISORA] Buffer vacío — usando último frame confirmado")
-                        best_frame = _last_confirmed_frame
-                        best_conf  = _last_confirmed_conf
-                        best_wbox  = _last_confirmed_wbox
-                        top3 = [(best_frame, best_conf, 0.0, best_wbox)]
-                    else:
-                        print("[VISORA] Sin frames disponibles — solo alerta sin imagen")
-                        patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id, 0.0, None)
-                        last_alert_time = time.time()
-                        _buf.clear()
-                        _pending_event_id = None
-                        _pending_alert_id = None
-                        continue
-
-                    # Try to identify carrier across top-3 frames (stop on first known match)
-                    identity: Optional[Dict] = None
-                    face_app = _face_app_ref[0]
-                    if face_app is None:
-                        print("[VISORA] InsightFace aún cargando — identificación omitida")
-                    else:
-                        for cand_frame, _, _, cand_wbox in top3:
-                            pose_cand = yolo_pose.predict(
-                                source=cand_frame, conf=POSE_CONF, imgsz=POSE_IMGSZ,
-                                verbose=False, device=_device,
-                            )[0]
-                            identity = identify_carrier(
-                                cand_frame, cand_wbox, face_app, centroids, pose_cand,
-                            )
-                            if identity and identity.get("known"):
-                                break
-
-                    if identity:
-                        tag = identity.get("nombre", "DESCONOCIDO") if identity.get("known") else "DESCONOCIDO"
-                        LOG.info("Portador: %s (face_score=%.2f, known=%s)", tag, identity.get("face_score", 0), identity.get("known"))
-                    else:
-                        LOG.info("No se pudo identificar al portador — sin rostro detectado")
-
-                    # Save best frame as snapshot (served by /detect/snapshot endpoint)
-                    snap = best_frame.copy()
-                    draw_confirmed_detection(snap, {"weapon_box": best_wbox})
-                    _save_snapshot(snap, CAMERA_ID)
-
-                    # PATCH event + alert with identity result
-                    patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id, best_conf, identity)
-                    last_alert_time = time.time()
-
-                    _buf.clear()
-                    _pending_event_id = None
-                    _pending_alert_id = None
+                # frames collected above; buffer closed unconditionally below
 
             if not HEADLESS:
                 draw_confirmed_detection(frame_bgr, best)
                 lbl = f"ARMA — {'CAPTURANDO' if _buffering else 'CONFIRMADA'}"
                 draw_status(frame_bgr, lbl, (0, 60, 255) if _buffering else (0, 0, 255))
+
+        # ── Buffer close: every frame, regardless of weapon visibility ──────────
+        if _buffering and time.time() - _buf_start >= CAPTURE_WINDOW:
+            _buffering = False
+            top3 = []
+            if _buf:
+                max_conf  = max(e[1] for e in _buf) or 1.0
+                max_sharp = max(e[2] for e in _buf) or 1.0
+                ranked = sorted(
+                    _buf,
+                    key=lambda e: 0.7 * (e[1] / max_conf) + 0.3 * (e[2] / max_sharp),
+                    reverse=True,
+                )
+                top3 = ranked[:3]
+                best_frame, best_conf, _, best_wbox = top3[0]
+            elif _last_confirmed_frame is not None:
+                LOG.info("Buffer vacío — usando último frame confirmado")
+                best_frame = _last_confirmed_frame
+                best_conf  = _last_confirmed_conf
+                best_wbox  = _last_confirmed_wbox
+                top3 = [(best_frame, best_conf, 0.0, best_wbox)]
+            else:
+                LOG.info("Sin frames disponibles — cerrando evento sin imagen")
+                patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id, 0.0, None)
+                last_alert_time = time.time()
+                _buf.clear()
+                _pending_event_id = None
+                _pending_alert_id = None
+
+            if top3:
+                identity: Optional[Dict] = None
+                face_app = _face_app_ref[0]
+                if face_app is None:
+                    LOG.info("InsightFace aún cargando — identificación omitida")
+                else:
+                    for cand_frame, _, _, cand_wbox in top3:
+                        pose_cand = yolo_pose.predict(
+                            source=cand_frame, conf=POSE_CONF, imgsz=POSE_IMGSZ,
+                            verbose=False, device=_device,
+                        )[0]
+                        identity = identify_carrier(
+                            cand_frame, cand_wbox, face_app, centroids, pose_cand,
+                        )
+                        if identity and identity.get("known"):
+                            break
+
+                if identity:
+                    tag = identity.get("nombre", "DESCONOCIDO") if identity.get("known") else "DESCONOCIDO"
+                    LOG.info("Portador: %s (face_score=%.2f, known=%s)", tag, identity.get("face_score", 0), identity.get("known"))
+                else:
+                    LOG.info("No se pudo identificar al portador — sin rostro detectado")
+
+                snap = best_frame.copy()
+                draw_confirmed_detection(snap, {"weapon_box": best_wbox})
+                _save_snapshot(snap, CAMERA_ID)
+                _upload_event_frame(token_ref, _pending_event_id, snap)
+                patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id, best_conf, identity)
+                last_alert_time = time.time()
+                _buf.clear()
+                _pending_event_id = None
+                _pending_alert_id = None
 
         elif detections:
             LOG.debug("YOLO detectó %d candidato(s) pero todos rechazados por NASNet/pose", len(detections))
