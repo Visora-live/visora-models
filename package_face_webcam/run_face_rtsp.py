@@ -1,34 +1,35 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "quiet")
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;0")
 
 import cv2
 import numpy as np
-import requests
 from insightface.app import FaceAnalysis
 
 # ── Config via env vars ───────────────────────────────────────────────────────
 CAMERA_ID        = int(os.getenv("CAMERA_ID", "1"))
 RTSP_URL         = os.getenv("RTSP_URL", f"rtsp://localhost:8554/cam{CAMERA_ID}")
-API_BASE         = os.getenv("API_BASE", "http://localhost:8000/api")
-API_USER         = os.getenv("VISORA_USER", "admin")
-API_PASS         = os.getenv("VISORA_PASS", "")
 HEADLESS         = os.getenv("HEADLESS", "0") == "1"
 FRAME_SKIP       = int(os.getenv("FRAME_SKIP", "1"))
-UNKNOWN_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "30"))
-KNOWN_COOLDOWN   = int(os.getenv("KNOWN_COOLDOWN", "120"))
 SNAPSHOT_DIR     = Path(os.getenv("SNAPSHOT_DIR", r"C:\visora_snapshots"))
 PAUSE_FILE       = SNAPSHOT_DIR / f"cam{CAMERA_ID}.face_paused"
+
+# ── Identificación bajo pedido (disparada por el worker de armas) ─────────────
+# El worker de armas escribe cam{ID}_evt{event_id}.json cuando detecta un arma;
+# este worker responde con cam{ID}_evt{event_id}.result.json. Ya no genera
+# eventos/alertas propios — solo identifica cuando se le pide.
+PENDING_IDENT_DIR = Path(os.getenv("PENDING_IDENT_DIR", "/opt/visora/workers/shared/pending_ident"))
 
 _DEFAULT_CENTROIDS = (
     Path(__file__).resolve().parent
@@ -63,141 +64,75 @@ def _setup_logger() -> logging.Logger:
 LOG = _setup_logger()
 
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Identificación bajo pedido ────────────────────────────────────────────────
 
-def api_login() -> str:
-    resp = requests.post(
-        f"{API_BASE}/auth/login",
-        json={"username_or_email": API_USER, "password": API_PASS},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    token = resp.json().get("access_token", "")
-    LOG.info("Login OK como '%s' en %s", API_USER, API_BASE)
-    return token
-
-
-def get_tienda_id(token: str) -> Optional[int]:
-    try:
-        resp = requests.get(
-            f"{API_BASE}/cameras/{CAMERA_ID}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json().get("tienda_id")
-    except Exception as exc:
-        LOG.warning("No se pudo obtener tienda_id: %s", exc)
-    return None
-
-
-# ── API reporting ─────────────────────────────────────────────────────────────
-
-def _post_with_refresh(
-    token_ref: List[str],
-    method: str,
-    url: str,
-    payload: Dict,
-) -> Optional[Dict]:
-    def _attempt(tok: str) -> requests.Response:
-        return requests.request(
-            method, url,
-            json=payload,
-            headers={"Authorization": f"Bearer {tok}"},
-            timeout=10,
-        )
-
-    try:
-        resp = _attempt(token_ref[0])
-        if resp.status_code in (401, 403):
-            LOG.warning("Token expirado — renovando...")
-            token_ref[0] = api_login()
-            resp = _attempt(token_ref[0])
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        LOG.error("Error HTTP %s %s: %s", method, url, exc)
+def _closest_face(faces: List, weapon_box: Optional[Sequence[float]]):
+    if not faces:
         return None
+    if not weapon_box:
+        return faces[0]
+    wx = (weapon_box[0] + weapon_box[2]) / 2.0
+    wy = (weapon_box[1] + weapon_box[3]) / 2.0
+    best_face = None
+    best_dist = None
+    for face in faces:
+        fx1, fy1, fx2, fy2 = face.bbox.astype(float)
+        fx, fy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+        dist = ((fx - wx) ** 2 + (fy - wy) ** 2) ** 0.5
+        if best_dist is None or dist < best_dist:
+            best_dist, best_face = dist, face
+    return best_face
 
 
-def post_known_face(
-    token_ref: List[str],
-    tienda_id: Optional[int],
-    nombre: Optional[str],
-    apellido_paterno: Optional[str],
-    apellido_materno: Optional[str],
-    dni: str,
-    edad: Optional[int],
-    score: float,
-) -> None:
-    parts = [p for p in [nombre, apellido_paterno, apellido_materno] if p]
-    full_name = " ".join(parts) if parts else dni
-    comment = f"Identificado: {full_name} (DNI: {dni}) — confianza {score:.2f}"
+def respond_pending_identifications(faces: List, centroids: List[Dict]) -> None:
+    """Answers pending identification requests dropped by the weapon worker.
 
-    result = _post_with_refresh(
-        token_ref, "POST", f"{API_BASE}/events",
-        {
-            "tipo": "facial_recognition",
-            "severidad": "baja",
-            "estado": "abierto",
-            "camara_id": CAMERA_ID,
-            "comentario": comment,
-        },
-    )
-    if result:
-        event_id = result.get("id")
-        LOG.info("ROSTRO CONOCIDO — evento #%s | %s (DNI:%s) score=%.2f", event_id, full_name, dni, score)
-        if event_id:
-            _post_with_refresh(
-                token_ref, "POST", f"{API_BASE}/identifications",
-                {
-                    "evento_id":                event_id,
-                    "nombre":                   nombre,
-                    "apellido":                 apellido_paterno,
-                    "apellido_materno":         apellido_materno,
-                    "dni":                      dni,
-                    "edad":                     edad,
-                    "confianza_identificacion": round(score, 4),
-                    "fuente":                   "ia",
-                },
-            )
+    This worker no longer creates its own events/alerts — it only reacts to
+    a weapon detection, identifying whichever face is closest to the weapon.
+    """
+    if not faces:
+        return
+    for req_path in sorted(PENDING_IDENT_DIR.glob(f"cam{CAMERA_ID}_evt*.json")):
+        if req_path.name.endswith(".result.json"):
+            continue
+        try:
+            req = json.loads(req_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.error("Pedido de identificación ilegible (%s): %s", req_path.name, exc)
+            req_path.unlink(missing_ok=True)
+            continue
 
+        face = _closest_face(faces, req.get("weapon_box"))
+        if face is None:
+            continue
 
-def post_unknown_face(
-    token_ref: List[str],
-    tienda_id: Optional[int],
-    best_score: float,
-) -> None:
-    comment = f"Rostro desconocido — similitud máxima: {best_score:.2f}"
+        emb = (
+            face.normed_embedding
+            if hasattr(face, "normed_embedding") and face.normed_embedding is not None
+            else face.embedding
+        )
+        best, score = match_face(emb, centroids)
+        is_known = best is not None and score >= THRESHOLD
 
-    ev = _post_with_refresh(
-        token_ref, "POST", f"{API_BASE}/events",
-        {
-            "tipo": "facial_recognition",
-            "severidad": "media",
-            "estado": "abierto",
-            "camara_id": CAMERA_ID,
-            "comentario": comment,
-        },
-    )
-    event_id = ev.get("id") if ev else None
-
-    alert_payload: Dict = {
-        "titulo": "Rostro no identificado detectado",
-        "descripcion": comment,
-        "tipo": "facial_recognition",
-        "severidad": "media",
-        "estado": "abierta",
-        "camara_id": CAMERA_ID,
-    }
-    if event_id:
-        alert_payload["evento_id"] = event_id
-    if tienda_id is not None:
-        alert_payload["tienda_id"] = tienda_id
-
-    result = _post_with_refresh(token_ref, "POST", f"{API_BASE}/alerts", alert_payload)
-    if result:
-        LOG.info("ROSTRO DESCONOCIDO — alerta #%s | score=%.2f", result.get("id"), best_score)
+        result = {
+            "known": is_known,
+            "face_score": round(float(score), 4),
+            "nombre": best.get("nombre") if is_known else None,
+            "apellido_paterno": best.get("apellido_paterno") if is_known else None,
+            "apellido_materno": best.get("apellido_materno") if is_known else None,
+            "dni": best.get("dni") if is_known else None,
+            "edad": best.get("edad") if is_known else None,
+        }
+        res_path = req_path.parent / (req_path.stem + ".result.json")
+        try:
+            res_path.write_text(json.dumps(result))
+        except OSError as exc:
+            LOG.error("No se pudo escribir resultado de identificación: %s", exc)
+        req_path.unlink(missing_ok=True)
+        LOG.info(
+            "Identificación respondida — evento #%s: %s (score=%.2f)",
+            req.get("evento_id"), result["nombre"] if is_known else "DESCONOCIDO", score,
+        )
 
 
 # ── Centroids ─────────────────────────────────────────────────────────────────
@@ -311,9 +246,8 @@ def main() -> None:
     LOG.info("=" * 60)
     LOG.info("VISORA FACE WORKER — cámara %d", CAMERA_ID)
     LOG.info("RTSP URL: %s", RTSP_URL)
-    LOG.info("API: %s  usuario: %s", API_BASE, API_USER)
-    LOG.info("THRESHOLD: %.2f  KNOWN_COOLDOWN: %ds  UNKNOWN_COOLDOWN: %ds  FRAME_SKIP: %d",
-             THRESHOLD, KNOWN_COOLDOWN, UNKNOWN_COOLDOWN, FRAME_SKIP)
+    LOG.info("THRESHOLD: %.2f  FRAME_SKIP: %d", THRESHOLD, FRAME_SKIP)
+    LOG.info("Identificación bajo pedido — pending dir: %s", PENDING_IDENT_DIR)
     LOG.info("=" * 60)
 
     LOG.info("Cargando centroides desde %s ...", CENTROIDS_PATH)
@@ -335,22 +269,13 @@ def main() -> None:
     face_app.prepare(ctx_id=_ctx, det_size=(DET_SIZE, DET_SIZE), det_thresh=DET_THRESH)
     LOG.info("InsightFace listo — ctx_id=%d (%s)", _ctx, "GPU" if _ctx == 0 else "CPU")
 
-    LOG.info("Conectando al backend %s ...", API_BASE)
-    try:
-        token_ref = [api_login()]
-    except Exception as exc:
-        LOG.critical("FALLO DE LOGIN — worker no puede continuar: %s", exc)
-        return
-    tienda_id = get_tienda_id(token_ref[0])
-    LOG.info("Cámara %d → tienda_id=%s", CAMERA_ID, tienda_id)
+    PENDING_IDENT_DIR.mkdir(parents=True, exist_ok=True)
 
     LOG.info("Abriendo stream RTSP: %s", RTSP_URL)
     LOG.info("Si ves 'DESCRIBE failed 404', el stream no existe en MediaMTX — verifica que la fuente esté publicando.")
     cap = LatestFrameCapture(RTSP_URL)
     time.sleep(2)
 
-    last_known:   Dict[str, float] = {}
-    last_unknown  = 0.0
     frame_counter = 0
     frames_processed = 0
     last_stats_log = time.time()
@@ -366,12 +291,21 @@ def main() -> None:
         frames_processed += 1
 
         if time.time() - last_stats_log >= 60:
-            LOG.info("ALIVE — frames procesados: %d | cooldown unknown restante: %.0fs",
-                     frames_processed, max(0, UNKNOWN_COOLDOWN - (time.time() - last_unknown)))
+            LOG.info("ALIVE — frames procesados: %d", frames_processed)
             last_stats_log = time.time()
 
         if frame_counter % FRAME_SKIP != 0:
             if not HEADLESS:
+                cv2.imshow(window_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            continue
+
+        if PAUSE_FILE.exists():
+            LOG.debug("Detección pausada (pause file existe)")
+            if not HEADLESS:
+                cv2.putText(frame, "Deteccion pausada", (20, 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 cv2.imshow(window_name, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
@@ -393,62 +327,34 @@ def main() -> None:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (100, 100, 100), 2, cv2.LINE_AA)
         else:
             LOG.debug("%d rostro(s) detectado(s) en frame", len(faces))
-            for face in faces:
-                emb = (
-                    face.normed_embedding
-                    if hasattr(face, "normed_embedding") and face.normed_embedding is not None
-                    else face.embedding
-                )
-                best, score = match_face(emb, centroids)
-                is_known = best is not None and score >= THRESHOLD
+            save_snapshot(frame)
+            respond_pending_identifications(faces, centroids)
 
-                x1, y1, x2, y2 = face.bbox.astype(float)
-                left  = max(0, int(x1 - pad_x))
-                top   = max(0, int(y1 - pad_y))
-                right = min(w - 1, int(x2 - pad_x))
-                bot   = min(h - 1, int(y2 - pad_y))
+            if not HEADLESS:
+                for face in faces:
+                    emb = (
+                        face.normed_embedding
+                        if hasattr(face, "normed_embedding") and face.normed_embedding is not None
+                        else face.embedding
+                    )
+                    best, score = match_face(emb, centroids)
+                    is_known = best is not None and score >= THRESHOLD
 
-                if PAUSE_FILE.exists():
-                    LOG.debug("Detección pausada (pause file existe)")
-                    if not HEADLESS:
-                        cv2.putText(output, "Deteccion pausada", (20, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                    break
+                    x1, y1, x2, y2 = face.bbox.astype(float)
+                    left  = max(0, int(x1 - pad_x))
+                    top   = max(0, int(y1 - pad_y))
+                    right = min(w - 1, int(x2 - pad_x))
+                    bot   = min(h - 1, int(y2 - pad_y))
 
-                if is_known:
-                    color = (0, 180, 0)
-                    parts = [p for p in [best.get("nombre"), best.get("apellido_paterno"), best.get("apellido_materno")] if p]
-                    full  = " ".join(parts) if parts else best["dni"]
-                    label = f"{full} ({score:.2f})"
-                    now   = time.time()
-                    iid   = best["identity_id"]
-                    cooldown_left = KNOWN_COOLDOWN - (now - last_known.get(iid, 0.0))
-                    if cooldown_left <= 0:
-                        LOG.debug("Rostro conocido match: %s score=%.2f — registrando evento", full, score)
-                        post_known_face(
-                            token_ref, tienda_id,
-                            best.get("nombre"), best.get("apellido_paterno"),
-                            best.get("apellido_materno"), best["dni"],
-                            best.get("edad"), score,
-                        )
-                        last_known[iid] = now
-                        save_snapshot(frame)
+                    if is_known:
+                        color = (0, 180, 0)
+                        parts = [p for p in [best.get("nombre"), best.get("apellido_paterno"), best.get("apellido_materno")] if p]
+                        full  = " ".join(parts) if parts else best["dni"]
+                        label = f"{full} ({score:.2f})"
                     else:
-                        LOG.debug("Rostro conocido %s score=%.2f — cooldown %.0fs restante", full, score, cooldown_left)
-                else:
-                    color = (0, 60, 200)
-                    label = f"Desconocido ({score:.2f})"
-                    now   = time.time()
-                    cooldown_left = UNKNOWN_COOLDOWN - (now - last_unknown)
-                    if cooldown_left <= 0:
-                        LOG.debug("Rostro desconocido score=%.2f — registrando evento+alerta", score)
-                        post_unknown_face(token_ref, tienda_id, score)
-                        last_unknown = now
-                        save_snapshot(frame)
-                    else:
-                        LOG.debug("Rostro desconocido score=%.2f — cooldown %.0fs restante", score, cooldown_left)
+                        color = (0, 60, 200)
+                        label = f"Desconocido ({score:.2f})"
 
-                if not HEADLESS:
                     cv2.rectangle(output, (left, top), (right, bot), color, 2)
                     cv2.putText(output, label, (left, max(0, top - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import json
 import logging
 import os
 import sys
@@ -25,7 +25,6 @@ from ultralytics import YOLO
 
 import tensorflow as tf
 from tensorflow.keras.applications.nasnet import preprocess_input
-from insightface.app import FaceAnalysis
 
 # ── Worker config — edit these or set as environment variables ────────────────
 CAMERA_ID      = int(os.getenv("CAMERA_ID", "1"))
@@ -58,17 +57,6 @@ def _setup_logger() -> logging.Logger:
 
 LOG = _setup_logger()
 
-# ── Face ID config ───────────────────────────────────────────────────────────
-_DEFAULT_CENTROIDS = (
-    Path(__file__).resolve().parents[1]
-    / "package_face_webcam" / "reports" / "custom_face_enrollment" / "custom_gallery_centroids.csv"
-)
-CENTROIDS_PATH  = Path(os.getenv("CENTROIDS_PATH", str(_DEFAULT_CENTROIDS)))
-FACE_THRESHOLD  = float(os.getenv("FACE_THRESHOLD", "0.38"))
-FACE_DET_SIZE   = 320
-FACE_DET_THRESH = 0.35
-FACE_CROP_RATIO = 0.40   # top 40% of person bbox = face zone
-
 # ── Detection config ──────────────────────────────────────────────────────────
 YOLO_CONF              = 0.35
 YOLO_IMGSZ             = int(os.getenv("YOLO_IMGSZ", "640"))   # 640 recommended on GPU; set env to 480 on CPU
@@ -81,7 +69,6 @@ ARM_ZONE_MARGIN        = 40
 IOU_DUPLICATE_THRESHOLD = 0.5
 CAPTURE_WINDOW  = float(os.getenv("CAPTURE_WINDOW", "3.0"))  # reduced from 5s — 3s enough for best frame
 BLUR_MIN_VAR    = 40.0   # Laplacian variance below this = too blurry, skip frame from buffer
-FACE_CROP_PAD   = 15     # extra pixels of padding around face zone crop
 
 CLASS_NAMES = ["arma", "no_arma"]
 
@@ -94,7 +81,6 @@ KP_RIGHT_WRIST    = 10
 
 # ── Image processing — built once, reused per-crop ────────────────────────────
 _CLAHE_CROP     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-_CLAHE_FACE     = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4))
 _SHARPEN_KERNEL = np.array([[0, -0.5, 0], [-0.5, 3.0, -0.5], [0, -0.5, 0]], dtype=np.float32)
 
 
@@ -119,115 +105,51 @@ def validate_model_paths(paths: Dict[str, Path]) -> None:
             raise FileNotFoundError(f"No se encontró el modelo `{label}` en: {path}")
 
 
-# ── Face ID helpers ───────────────────────────────────────────────────────────
+# ── Face identification handoff (to visora-face-worker) ───────────────────────
+# The weapon worker no longer runs its own InsightFace matching — that used to
+# mean two processes on this box independently loading InsightFace and reading
+# the same stream. Instead, it hands the weapon's bounding box off to the
+# dedicated face worker (same host, separate systemd service, already watching
+# this camera) via a small shared-file queue, and waits briefly for the result.
 
-def _normalize(emb: np.ndarray) -> np.ndarray:
-    emb = np.asarray(emb, dtype=np.float32)
-    n = np.linalg.norm(emb)
-    return emb / n if n > 0 else emb
-
-
-def load_centroids(path: Path) -> List[Dict]:
-    if not path.exists():
-        LOG.warning("Centroides no encontrados: %s — identificación facial deshabilitada", path)
-        return []
-    rows: List[Dict] = []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            vals = [float(v) for v in str(row["centroid_vector"]).split("|") if v.strip()]
-            edad_raw = row.get("edad", "").strip()
-            rows.append({
-                "identity_id":      str(row.get("identity_id", "")).strip(),
-                "nombre":           str(row.get("nombre", "")).strip() or None,
-                "apellido_paterno": str(row.get("apellido_paterno", "")).strip() or None,
-                "apellido_materno": str(row.get("apellido_materno", "")).strip() or None,
-                "dni":              str(row.get("dni", "")).strip(),
-                "edad":             int(edad_raw) if edad_raw.isdigit() else None,
-                "centroid":         _normalize(np.array(vals, dtype=np.float32)),
-            })
-    LOG.info("%d identidades cargadas para reconocimiento facial", len(rows))
-    return rows
+PENDING_IDENT_DIR = Path(os.getenv("PENDING_IDENT_DIR", "/opt/visora/workers/shared/pending_ident"))
+IDENT_WAIT_TIMEOUT  = float(os.getenv("IDENT_WAIT_TIMEOUT", "4.0"))
+IDENT_POLL_INTERVAL = 0.2
 
 
-def match_face(embedding: np.ndarray, centroids: List[Dict]) -> Tuple[Optional[Dict], float]:
-    if not centroids:
-        return None, 0.0
-    emb = _normalize(embedding)
-    best, best_score = max(((c, float(np.dot(emb, c["centroid"]))) for c in centroids), key=lambda x: x[1])
-    return best, best_score
-
-
-def find_carrier_person_box(
-    weapon_box: Sequence[float], pose_result
-) -> Optional[List[float]]:
-    """Return the bounding box of the person closest to the weapon center."""
-    if pose_result.boxes is None or len(pose_result.boxes) == 0:
+def request_face_identification(event_id: int, weapon_box: Sequence[float]) -> Optional[Dict]:
+    """Ask the face worker to identify whoever is nearest weapon_box and wait
+    briefly for the result. Returns {"known": bool, "nombre":..., "dni":...,
+    "face_score":...} (same shape the old identify_carrier returned), or None
+    if the face worker never answered in time — treated as "not identified"."""
+    PENDING_IDENT_DIR.mkdir(parents=True, exist_ok=True)
+    req_path = PENDING_IDENT_DIR / f"cam{CAMERA_ID}_evt{event_id}.json"
+    res_path = PENDING_IDENT_DIR / f"cam{CAMERA_ID}_evt{event_id}.result.json"
+    try:
+        req_path.write_text(json.dumps({
+            "camera_id": CAMERA_ID,
+            "evento_id": event_id,
+            "weapon_box": [float(v) for v in weapon_box],
+            "created_at": time.time(),
+        }))
+    except OSError as exc:
+        LOG.error("No se pudo escribir pedido de identificación: %s", exc)
         return None
-    wcx, wcy = box_center(weapon_box)
-    best_box, best_dist = None, float("inf")
-    for pb in pose_result.boxes:
-        pbox = pb.xyxy[0].cpu().numpy().tolist()
-        cx, cy = box_center(pbox)
-        dist = math.hypot(cx - wcx, cy - wcy)
-        if dist < best_dist:
-            best_dist = dist
-            best_box = pbox
-    return best_box
 
+    identity: Optional[Dict] = None
+    deadline = time.time() + IDENT_WAIT_TIMEOUT
+    while time.time() < deadline:
+        if res_path.exists():
+            try:
+                identity = json.loads(res_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                LOG.error("Resultado de identificación ilegible: %s", exc)
+            break
+        time.sleep(IDENT_POLL_INTERVAL)
 
-def crop_face_zone(
-    frame: np.ndarray, person_box: Sequence[float], ratio: float = FACE_CROP_RATIO
-) -> Optional[np.ndarray]:
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = map(int, person_box)
-    face_h = max(1, int((y2 - y1) * ratio))
-    x1c = max(0, x1 - FACE_CROP_PAD)
-    y1c = max(0, y1 - FACE_CROP_PAD)
-    x2c = min(w, x2 + FACE_CROP_PAD)
-    y2c = min(h, y1c + face_h + FACE_CROP_PAD * 2)
-    crop = frame[y1c:y2c, x1c:x2c]
-    return crop if crop.size > 0 else None
-
-
-def _get_embedding(face_obj) -> np.ndarray:
-    emb = face_obj.normed_embedding if (hasattr(face_obj, "normed_embedding") and face_obj.normed_embedding is not None) else face_obj.embedding
-    return np.asarray(emb, dtype=np.float32)
-
-
-def identify_carrier(
-    frame: np.ndarray,
-    weapon_box: Sequence[float],
-    face_app: FaceAnalysis,
-    centroids: List[Dict],
-    pose_result=None,
-) -> Optional[Dict]:
-    """Identify weapon carrier. Pose-guided crop first, full-frame fallback if needed."""
-    def _resolve(emb: np.ndarray) -> Optional[Dict]:
-        identity, score = match_face(emb, centroids)
-        if identity and score >= FACE_THRESHOLD:
-            return {**identity, "face_score": score, "known": True}
-        return {"known": False, "face_score": score}
-
-    # Pose-guided: crop top face zone of the person nearest the weapon
-    if pose_result is not None:
-        person_box = find_carrier_person_box(weapon_box, pose_result)
-        if person_box is not None:
-            crop = crop_face_zone(frame, person_box)
-            if crop is not None:
-                faces = face_app.get(enhance_face_crop(crop))
-                if faces:
-                    return _resolve(_get_embedding(faces[0]))
-
-    # Fallback: all faces in full frame, pick closest to weapon center
-    all_faces = face_app.get(frame)
-    if not all_faces:
-        return None
-    wcx, wcy = box_center(weapon_box)
-    closest = min(
-        all_faces,
-        key=lambda f: euclidean_distance(box_center(f.bbox.tolist()), (wcx, wcy)),
-    )
-    return _resolve(_get_embedding(closest))
+    req_path.unlink(missing_ok=True)
+    res_path.unlink(missing_ok=True)
+    return identity
 
 
 # ── Backend integration ───────────────────────────────────────────────────────
@@ -615,15 +537,6 @@ def enhance_crop(crop: np.ndarray) -> np.ndarray:
     return cv2.filter2D(enhanced, -1, _SHARPEN_KERNEL)
 
 
-def enhance_face_crop(crop: np.ndarray) -> np.ndarray:
-    """Softer CLAHE + unsharp-mask on face crop before InsightFace."""
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = _CLAHE_FACE.apply(l)
-    enhanced = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    return cv2.filter2D(enhanced, -1, _SHARPEN_KERNEL)
-
-
 # ── Frame capture thread ──────────────────────────────────────────────────────
 
 class LatestFrameCapture:
@@ -702,25 +615,7 @@ def main() -> None:
         compile=False,
     )
     LOG.info("Modelos de detección listos")
-
-    # ── InsightFace carga en hilo de fondo para no bloquear la detección ─────
-    _face_app_ref: List[Optional[FaceAnalysis]] = [None]
-    _face_ready   = threading.Event()
-    centroids     = load_centroids(CENTROIDS_PATH)
-
-    def _load_face_bg() -> None:
-        try:
-            LOG.info("Cargando InsightFace buffalo_l en segundo plano...")
-            app = FaceAnalysis(name="buffalo_l")
-            app.prepare(ctx_id=0, det_size=(FACE_DET_SIZE, FACE_DET_SIZE), det_thresh=FACE_DET_THRESH)
-            _face_app_ref[0] = app
-            LOG.info("InsightFace listo — identificación facial activada")
-        except Exception as exc:
-            LOG.error("InsightFace no pudo cargar: %s", exc)
-        finally:
-            _face_ready.set()
-
-    threading.Thread(target=_load_face_bg, daemon=True).start()
+    LOG.info("Identificación facial delegada al worker facial vía %s", PENDING_IDENT_DIR)
 
     LOG.info("Conectando al backend %s ...", API_BASE)
     try:
@@ -930,27 +825,14 @@ def main() -> None:
                 _pending_alert_id = None
 
             if top3:
-                identity: Optional[Dict] = None
-                face_app = _face_app_ref[0]
-                if face_app is None:
-                    LOG.info("InsightFace aún cargando — identificación omitida")
-                else:
-                    for cand_frame, _, _, cand_wbox in top3:
-                        pose_cand = yolo_pose.predict(
-                            source=cand_frame, conf=POSE_CONF, imgsz=POSE_IMGSZ,
-                            verbose=False, device=_device,
-                        )[0]
-                        identity = identify_carrier(
-                            cand_frame, cand_wbox, face_app, centroids, pose_cand,
-                        )
-                        if identity and identity.get("known"):
-                            break
+                LOG.info("Solicitando identificación al worker facial — evento #%s", _pending_event_id)
+                identity = request_face_identification(_pending_event_id, best_wbox)
 
                 if identity:
                     tag = identity.get("nombre", "DESCONOCIDO") if identity.get("known") else "DESCONOCIDO"
                     LOG.info("Portador: %s (face_score=%.2f, known=%s)", tag, identity.get("face_score", 0), identity.get("known"))
                 else:
-                    LOG.info("No se pudo identificar al portador — sin rostro detectado")
+                    LOG.info("No se pudo identificar al portador — worker facial no respondió a tiempo")
 
                 snap = best_frame.copy()
                 draw_confirmed_detection(snap, {"weapon_box": best_wbox})
