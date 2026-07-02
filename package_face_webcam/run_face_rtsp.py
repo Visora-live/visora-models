@@ -30,6 +30,10 @@ PAUSE_FILE       = SNAPSHOT_DIR / f"cam{CAMERA_ID}.face_paused"
 # este worker responde con cam{ID}_evt{event_id}.result.json. Ya no genera
 # eventos/alertas propios — solo identifica cuando se le pide.
 PENDING_IDENT_DIR = Path(os.getenv("PENDING_IDENT_DIR", "/opt/visora/workers/shared/pending_ident"))
+# Fracción de la diagonal del frame — una cara más lejos que esto del weapon_box
+# no se considera su portador (evita identificar a un inocente si el que sostiene
+# el arma tiene la cara tapada y es la única otra cara visible en el frame).
+MAX_IDENT_DIST_RATIO = float(os.getenv("MAX_IDENT_DIST_RATIO", "0.35"))
 
 _DEFAULT_CENTROIDS = (
     Path(__file__).resolve().parent
@@ -66,25 +70,40 @@ LOG = _setup_logger()
 
 # ── Identificación bajo pedido ────────────────────────────────────────────────
 
-def _closest_face(faces: List, weapon_box: Optional[Sequence[float]]):
-    if not faces:
+def _closest_face(
+    faces: List,
+    weapon_box: Optional[Sequence[float]],
+    pad_x: int,
+    pad_y: int,
+    max_dist: float,
+):
+    """Nearest face to weapon_box, both in original (unpadded) frame coords.
+
+    Rejects the match if the nearest face is farther than max_dist — otherwise,
+    if the actual weapon carrier's face is covered/undetected and someone else's
+    face happens to be the only one visible, that bystander gets misidentified
+    as the infractor just for being the sole candidate.
+    """
+    if not faces or not weapon_box:
         return None
-    if not weapon_box:
-        return faces[0]
     wx = (weapon_box[0] + weapon_box[2]) / 2.0
     wy = (weapon_box[1] + weapon_box[3]) / 2.0
     best_face = None
     best_dist = None
     for face in faces:
         fx1, fy1, fx2, fy2 = face.bbox.astype(float)
-        fx, fy = (fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0
+        fx, fy = (fx1 + fx2) / 2.0 - pad_x, (fy1 + fy2) / 2.0 - pad_y
         dist = ((fx - wx) ** 2 + (fy - wy) ** 2) ** 0.5
         if best_dist is None or dist < best_dist:
             best_dist, best_face = dist, face
+    if best_dist is None or best_dist > max_dist:
+        return None
     return best_face
 
 
-def respond_pending_identifications(faces: List, centroids: List[Dict]) -> None:
+def respond_pending_identifications(
+    faces: List, centroids: List[Dict], pad_x: int, pad_y: int, max_dist: float,
+) -> None:
     """Answers pending identification requests dropped by the weapon worker.
 
     This worker no longer creates its own events/alerts — it only reacts to
@@ -102,7 +121,7 @@ def respond_pending_identifications(faces: List, centroids: List[Dict]) -> None:
             req_path.unlink(missing_ok=True)
             continue
 
-        face = _closest_face(faces, req.get("weapon_box"))
+        face = _closest_face(faces, req.get("weapon_box"), pad_x, pad_y, max_dist)
         if face is None:
             continue
 
@@ -314,6 +333,7 @@ def main() -> None:
         h, w = frame.shape[:2]
         pad_x = int(w * PAD_RATIO)
         pad_y = int(h * PAD_RATIO)
+        max_ident_dist = MAX_IDENT_DIST_RATIO * ((w ** 2 + h ** 2) ** 0.5)
         padded = cv2.copyMakeBorder(
             frame, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REPLICATE
         )
@@ -328,7 +348,7 @@ def main() -> None:
         else:
             LOG.debug("%d rostro(s) detectado(s) en frame", len(faces))
             save_snapshot(frame)
-            respond_pending_identifications(faces, centroids)
+            respond_pending_identifications(faces, centroids, pad_x, pad_y, max_ident_dist)
 
             if not HEADLESS:
                 for face in faces:
