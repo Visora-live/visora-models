@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "quiet")
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;0")
+# RTSP_TRANSPORT: tcp (default) evita frames corruptos por pérdida de paquetes con udp.
+_RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "tcp").strip().lower()
+if _RTSP_TRANSPORT not in ("tcp", "udp"):
+    _RTSP_TRANSPORT = "tcp"
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    f"rtsp_transport;{_RTSP_TRANSPORT}|fflags;nobuffer|flags;low_delay|max_delay;0",
+)
 
 import cv2
 import numpy as np
@@ -120,6 +127,8 @@ def respond_pending_identifications(
             LOG.error("Pedido de identificación ilegible (%s): %s", req_path.name, exc)
             req_path.unlink(missing_ok=True)
             continue
+        if req.get("frame_path"):
+            continue  # se atiende con el frame del arma en respond_frame_requests()
 
         face = _closest_face(faces, req.get("weapon_box"), pad_x, pad_y, max_dist)
         if face is None:
@@ -152,6 +161,79 @@ def respond_pending_identifications(
             "Identificación respondida — evento #%s: %s (score=%.2f)",
             req.get("evento_id"), result["nombre"] if is_known else "DESCONOCIDO", score,
         )
+
+
+STALE_REQUEST_S = 30.0
+
+
+def _identify_on_frame(face_app, frame: np.ndarray, weapon_box, centroids: List[Dict]) -> Dict:
+    """Identifica al rostro más cercano al arma en ESTE frame (mismo padding y
+    distancia máxima que el modo en vivo). Siempre devuelve una respuesta: si no
+    hay rostro cercano responde known=False con face_score 0, en vez de dejar que
+    el worker de armas espere hasta el timeout."""
+    h, w = frame.shape[:2]
+    pad_x, pad_y = int(w * PAD_RATIO), int(h * PAD_RATIO)
+    max_dist = MAX_IDENT_DIST_RATIO * ((w ** 2 + h ** 2) ** 0.5)
+    padded = cv2.copyMakeBorder(frame, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_REPLICATE)
+    face = _closest_face(face_app.get(padded), weapon_box, pad_x, pad_y, max_dist)
+    if face is None:
+        return {"known": False, "face_score": 0.0, "nombre": None, "apellido_paterno": None,
+                "apellido_materno": None, "dni": None, "edad": None, "sin_rostro": True}
+    emb = face.normed_embedding if getattr(face, "normed_embedding", None) is not None else face.embedding
+    best, score = match_face(emb, centroids)
+    is_known = best is not None and score >= THRESHOLD
+    return {
+        "known": is_known,
+        "face_score": round(float(score), 4),
+        "nombre": best.get("nombre") if is_known else None,
+        "apellido_paterno": best.get("apellido_paterno") if is_known else None,
+        "apellido_materno": best.get("apellido_materno") if is_known else None,
+        "dni": best.get("dni") if is_known else None,
+        "edad": best.get("edad") if is_known else None,
+    }
+
+
+def respond_frame_requests(face_app, centroids: List[Dict]) -> int:
+    """Atiende los pedidos que traen el frame donde se confirmó el arma.
+    Devuelve cuántos pedidos SIN frame quedan pendientes (requieren el stream)."""
+    live_pending = 0
+    now = time.time()
+    for req_path in sorted(PENDING_IDENT_DIR.glob(f"cam{CAMERA_ID}_evt*.json")):
+        if req_path.name.endswith(".result.json"):
+            continue
+        try:
+            req = json.loads(req_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue  # puede estar escribiéndose; se reintenta en la siguiente vuelta
+        if now - float(req.get("created_at") or now) > STALE_REQUEST_S:
+            req_path.unlink(missing_ok=True)  # el worker de armas ya dejó de esperar
+            continue
+        frame_path = req.get("frame_path")
+        if not frame_path:
+            live_pending += 1
+            continue
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            continue
+        try:
+            result = _identify_on_frame(face_app, frame, req.get("weapon_box"), centroids)
+        except Exception as exc:
+            LOG.error("Error identificando sobre el frame del evento #%s: %s", req.get("evento_id"), exc)
+            continue
+        res_path = req_path.parent / (req_path.stem + ".result.json")
+        try:
+            res_path.write_text(json.dumps(result))
+        except OSError as exc:
+            LOG.error("No se pudo escribir resultado de identificación: %s", exc)
+            continue
+        req_path.unlink(missing_ok=True)
+        LOG.info(
+            "Identificación respondida (frame del arma) — evento #%s: %s (score=%.2f)",
+            req.get("evento_id"),
+            result["nombre"] if result["known"] else ("SIN ROSTRO" if result.get("sin_rostro") else "DESCONOCIDO"),
+            result["face_score"],
+        )
+    return live_pending
 
 
 # ── Centroids ─────────────────────────────────────────────────────────────────
@@ -300,7 +382,15 @@ def main() -> None:
     last_stats_log = time.time()
     window_name   = "VISORA — Face Detection"
 
+    LOG.info("Modo bajo pedido: InsightFace solo corre cuando el worker de armas lo solicita")
+
     while True:
+        live_pending = 0
+        try:
+            live_pending = respond_frame_requests(face_app, centroids)
+        except Exception as exc:
+            LOG.error("Error atendiendo pedidos con frame: %s", exc)
+
         ok, frame = cap.read()
         if not ok or frame is None:
             time.sleep(0.1)
@@ -328,6 +418,11 @@ def main() -> None:
                 cv2.imshow(window_name, frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+            continue
+
+        if HEADLESS and live_pending == 0:
+            # Sin pedidos pendientes no hay nada que identificar: no gastar CPU en InsightFace.
+            time.sleep(0.05)
             continue
 
         h, w = frame.shape[:2]

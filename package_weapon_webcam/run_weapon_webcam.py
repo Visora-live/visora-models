@@ -11,8 +11,12 @@ from datetime import datetime
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "quiet"
-# UDP = menor latencia en LAN. Si hay pérdida de paquetes frecuente, cambiar a tcp.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;0"
+# RTSP_TRANSPORT: tcp (default) evita los frames corruptos por pérdida de paquetes
+# que se observaron con udp en la validación (falsas detecciones sobre artefactos).
+_RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "tcp").strip().lower()
+if _RTSP_TRANSPORT not in ("tcp", "udp"):
+    _RTSP_TRANSPORT = "tcp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{_RTSP_TRANSPORT}|fflags;nobuffer|flags;low_delay|max_delay;0"
 
 import math
 import threading
@@ -63,7 +67,13 @@ YOLO_CONF              = 0.35
 YOLO_IMGSZ             = int(os.getenv("YOLO_IMGSZ", "640"))   # 640 recommended on GPU; set env to 480 on CPU
 POSE_CONF              = 0.35
 POSE_IMGSZ             = int(os.getenv("POSE_IMGSZ", "640"))
-NASNET_THRESHOLD       = 0.50
+NASNET_THRESHOLD       = float(os.getenv("NASNET_THRESHOLD", "0.50"))
+# Frames procesados consecutivos con arma confirmada antes de alertar (1 = comportamiento original).
+# Filtra confirmaciones sueltas sobre objetos cotidianos o frames con artefactos.
+CONFIRM_FRAMES         = max(1, int(os.getenv("CONFIRM_FRAMES", "1")))
+# Si el backend rechaza el evento (409 = detección en pausa desde la web), el worker deja
+# de inferir durante este tiempo en lugar de seguir analizando y pidiendo identificaciones.
+BACKEND_PAUSE_BACKOFF  = float(os.getenv("BACKEND_PAUSE_BACKOFF", "20"))
 HAND_DISTANCE_THRESHOLD = 120.0
 KP_CONF_MIN            = 0.25
 ARM_ZONE_MARGIN        = 40
@@ -85,6 +95,7 @@ FRAME_LOG_FIELDS  = [
     "n_yolo", "max_yolo", "n_cerca_mano", "n_nasnet", "max_nasnet",
     "n_confirmados", "conf_confirmada", "pausado", "cooldown_activo", "buffering",
     "evento_disparado", "evento_id", "conf_evento", "face_known", "face_score", "face_nombre",
+    "racha_confirmada",
 ]
 
 
@@ -228,19 +239,35 @@ IDENT_WAIT_TIMEOUT  = float(os.getenv("IDENT_WAIT_TIMEOUT", "4.0"))
 IDENT_POLL_INTERVAL = 0.2
 
 
-def request_face_identification(event_id: int, weapon_box: Sequence[float]) -> Optional[Dict]:
+def request_face_identification(
+    event_id: int, weapon_box: Sequence[float], frame: Optional[np.ndarray] = None,
+) -> Optional[Dict]:
     """Ask the face worker to identify whoever is nearest weapon_box and wait
     briefly for the result. Returns {"known": bool, "nombre":..., "dni":...,
     "face_score":...} (same shape the old identify_carrier returned), or None
-    if the face worker never answered in time — treated as "not identified"."""
+    if the face worker never answered in time — treated as "not identified".
+
+    When `frame` is given it is written next to the request so the face worker
+    identifies on the SAME frame where the weapon was confirmed, instead of on
+    its own live frame seconds later (the validation showed that desync caused
+    most of the missed identifications)."""
     PENDING_IDENT_DIR.mkdir(parents=True, exist_ok=True)
     req_path = PENDING_IDENT_DIR / f"cam{CAMERA_ID}_evt{event_id}.json"
     res_path = PENDING_IDENT_DIR / f"cam{CAMERA_ID}_evt{event_id}.result.json"
+    img_path = PENDING_IDENT_DIR / f"cam{CAMERA_ID}_evt{event_id}.jpg"
+    frame_path = None
+    if frame is not None:
+        try:
+            if cv2.imwrite(str(img_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+                frame_path = str(img_path)
+        except Exception as exc:
+            LOG.warning("No se pudo guardar el frame para identificación (se usará el stream): %s", exc)
     try:
         req_path.write_text(json.dumps({
             "camera_id": CAMERA_ID,
             "evento_id": event_id,
             "weapon_box": [float(v) for v in weapon_box],
+            "frame_path": frame_path,
             "created_at": time.time(),
         }))
     except OSError as exc:
@@ -260,6 +287,7 @@ def request_face_identification(event_id: int, weapon_box: Sequence[float]) -> O
 
     req_path.unlink(missing_ok=True)
     res_path.unlink(missing_ok=True)
+    img_path.unlink(missing_ok=True)
     return identity
 
 
@@ -658,6 +686,7 @@ class LatestFrameCapture:
         self._url   = url
         self._frame: Optional[np.ndarray] = None
         self._ok    = False
+        self._seq   = 0   # increments once per decoded frame
         self._lock  = threading.Lock()
         self._stop  = False
         self._thread = threading.Thread(target=self._reader, daemon=True)
@@ -691,6 +720,7 @@ class LatestFrameCapture:
             with self._lock:
                 self._ok    = True
                 self._frame = frame
+                self._seq  += 1
 
         cap.release()
 
@@ -699,6 +729,15 @@ class LatestFrameCapture:
             if self._frame is None:
                 return False, None
             return self._ok, self._frame.copy()
+
+    def read_new(self, last_seq: int) -> tuple[bool, Optional[np.ndarray], int]:
+        """Like read(), but only returns a frame that was decoded after `last_seq`.
+        Prevents analysing (and counting) the same frame more than once when
+        inference is faster than the stream."""
+        with self._lock:
+            if self._frame is None or self._seq == last_seq:
+                return False, None, last_seq
+            return self._ok, self._frame.copy(), self._seq
 
     def release(self) -> None:
         self._stop = True
@@ -768,9 +807,22 @@ def main() -> None:
     _buffering        = False
     _pending_event_id: Optional[int] = None
     _pending_alert_id: Optional[int] = None
+    _confirm_streak = 0
+    _backend_paused_until = 0.0
+    LOG.info("NASNET_THRESHOLD: %.2f  CONFIRM_FRAMES: %d  RTSP: %s", NASNET_THRESHOLD, CONFIRM_FRAMES, _RTSP_TRANSPORT)
 
+    _last_seq = 0
+    _last_new_frame_t = time.time()
     while True:
-        ok, frame_bgr = cap.read()
+        ok, frame_bgr, _seq = cap.read_new(_last_seq)
+        if ok and frame_bgr is not None:
+            _last_seq = _seq
+            _last_new_frame_t = time.time()
+        elif time.time() - _last_new_frame_t < 2.0:
+            # Stream vivo, el siguiente frame aún no llega: esperar sin reanalizar el mismo.
+            time.sleep(0.005)
+            continue
+        # Sin frame nuevo por >2 s: se trata como stream caído (abajo).
         if not ok or frame_bgr is None:
             # Flush orphaned buffer if stream died during capture window
             if _buffering and _pending_event_id and (time.time() - _buf_start) >= CAPTURE_WINDOW + 5:
@@ -795,6 +847,14 @@ def main() -> None:
                 cv2.imshow(window_name, frame_bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+            continue
+
+        if time.time() < _backend_paused_until:
+            # Detección en pausa en la web: no inferir (libera CPU para el resto del host).
+            try:
+                flog.write({"tipo": "frame", "frame_idx": _frame_counter, "pausado": 1})
+            except Exception:
+                pass
             continue
 
         _t_frame = time.time()
@@ -871,6 +931,7 @@ def main() -> None:
             [d for d in detections if d.get("weapon_confirmed")],
             IOU_DUPLICATE_THRESHOLD,
         )
+        _confirm_streak = _confirm_streak + 1 if confirmed_detections else 0
 
         if confirmed_detections:
             best       = confirmed_detections[0]
@@ -891,7 +952,8 @@ def main() -> None:
                 _last_confirmed_wbox  = weapon_box
 
                 # Start buffer window when cooldown allows — fire alert immediately
-                if not _buffering and now - last_alert_time >= ALERT_COOLDOWN:
+                if (not _buffering and now - last_alert_time >= ALERT_COOLDOWN
+                        and _confirm_streak >= CONFIRM_FRAMES):
                     _buffering = True
                     _buf_start = now
                     _buf.clear()
@@ -899,6 +961,14 @@ def main() -> None:
                     _flog_evt_id = _pending_event_id if _pending_event_id is not None else "409"
                     LOG.info("ARMA CONFIRMADA — confianza=%.0f%% | ventana de captura %.0fs iniciada | evento=#%s alerta=#%s",
                              confidence * 100, CAPTURE_WINDOW, _pending_event_id, _pending_alert_id)
+                    if _pending_event_id is None:
+                        # Evento rechazado (409: detección en pausa) o error de red: no abrir
+                        # ventana de captura ni pedir identificación para un evento inexistente.
+                        _buffering = False
+                        _buf.clear()
+                        _backend_paused_until = now + BACKEND_PAUSE_BACKOFF
+                        LOG.info("Evento no creado (¿detección en pausa?) — inferencia suspendida %.0fs",
+                                 BACKEND_PAUSE_BACKOFF)
 
                 # Collect confirmed frames — accept frames above a soft blur threshold
                 if _buffering and sharpness >= BLUR_MIN_VAR:
@@ -941,7 +1011,7 @@ def main() -> None:
 
             if top3:
                 LOG.info("Solicitando identificación al worker facial — evento #%s", _pending_event_id)
-                identity = request_face_identification(_pending_event_id, best_wbox)
+                identity = request_face_identification(_pending_event_id, best_wbox, best_frame)
 
                 if identity:
                     tag = identity.get("nombre", "DESCONOCIDO") if identity.get("known") else "DESCONOCIDO"
@@ -993,6 +1063,7 @@ def main() -> None:
                 "buffering": int(_buffering),
                 "evento_disparado": int(_flog_evt_id is not None),
                 "evento_id": "" if _flog_evt_id is None else _flog_evt_id,
+                "racha_confirmada": _confirm_streak,
             })
             flog.write(_row)
         except Exception:
