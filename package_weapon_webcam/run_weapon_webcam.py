@@ -686,6 +686,7 @@ class LatestFrameCapture:
         self._url   = url
         self._frame: Optional[np.ndarray] = None
         self._ok    = False
+        self._seq   = 0   # increments once per decoded frame
         self._lock  = threading.Lock()
         self._stop  = False
         self._thread = threading.Thread(target=self._reader, daemon=True)
@@ -719,6 +720,7 @@ class LatestFrameCapture:
             with self._lock:
                 self._ok    = True
                 self._frame = frame
+                self._seq  += 1
 
         cap.release()
 
@@ -727,6 +729,15 @@ class LatestFrameCapture:
             if self._frame is None:
                 return False, None
             return self._ok, self._frame.copy()
+
+    def read_new(self, last_seq: int) -> tuple[bool, Optional[np.ndarray], int]:
+        """Like read(), but only returns a frame that was decoded after `last_seq`.
+        Prevents analysing (and counting) the same frame more than once when
+        inference is faster than the stream."""
+        with self._lock:
+            if self._frame is None or self._seq == last_seq:
+                return False, None, last_seq
+            return self._ok, self._frame.copy(), self._seq
 
     def release(self) -> None:
         self._stop = True
@@ -800,8 +811,18 @@ def main() -> None:
     _backend_paused_until = 0.0
     LOG.info("NASNET_THRESHOLD: %.2f  CONFIRM_FRAMES: %d  RTSP: %s", NASNET_THRESHOLD, CONFIRM_FRAMES, _RTSP_TRANSPORT)
 
+    _last_seq = 0
+    _last_new_frame_t = time.time()
     while True:
-        ok, frame_bgr = cap.read()
+        ok, frame_bgr, _seq = cap.read_new(_last_seq)
+        if ok and frame_bgr is not None:
+            _last_seq = _seq
+            _last_new_frame_t = time.time()
+        elif time.time() - _last_new_frame_t < 2.0:
+            # Stream vivo, el siguiente frame aún no llega: esperar sin reanalizar el mismo.
+            time.sleep(0.005)
+            continue
+        # Sin frame nuevo por >2 s: se trata como stream caído (abajo).
         if not ok or frame_bgr is None:
             # Flush orphaned buffer if stream died during capture window
             if _buffering and _pending_event_id and (time.time() - _buf_start) >= CAPTURE_WINDOW + 5:
