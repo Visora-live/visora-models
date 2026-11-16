@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -71,6 +72,116 @@ CAPTURE_WINDOW  = float(os.getenv("CAPTURE_WINDOW", "3.0"))  # reduced from 5s �
 BLUR_MIN_VAR    = 40.0   # Laplacian variance below this = too blurry, skip frame from buffer
 
 CLASS_NAMES = ["arma", "no_arma"]
+
+# ── Frame-level metrics log (tesis: prod_metrics.py) ──────────────────────────
+# CSV aparte, una fila por frame procesado. Es solo observación: cualquier error
+# aquí se traga y NUNCA interrumpe la detección. Desactivar con FRAME_LOG=0.
+# Etiqueta de sesión: escribir el nombre en FRAME_LOG_DIR/cam{ID}.session
+# (p.ej. "S01_sin_arma"); sin archivo la sesión es "auto".
+FRAME_LOG_ENABLED = os.getenv("FRAME_LOG", "1") == "1"
+FRAME_LOG_DIR     = Path(os.getenv("FRAME_LOG_DIR", "/opt/visora/workers/frame_logs"))
+FRAME_LOG_FIELDS  = [
+    "ts_utc", "tipo", "session_id", "frame_idx", "proc_ms",
+    "n_yolo", "max_yolo", "n_cerca_mano", "n_nasnet", "max_nasnet",
+    "n_confirmados", "conf_confirmada", "pausado", "cooldown_activo", "buffering",
+    "evento_disparado", "evento_id", "conf_evento", "face_known", "face_score", "face_nombre",
+]
+
+
+class FrameLogger:
+    def __init__(self, camera_id: int) -> None:
+        self.enabled = FRAME_LOG_ENABLED
+        self.camera_id = camera_id
+        self.session_file = FRAME_LOG_DIR / f"cam{camera_id}.session"
+        self.session_id = "auto"
+        self._last_session_check = 0.0
+        self._fh = None
+        self._writer = None
+        self._file_key = None
+        self._rows = 0
+        self._errors = 0
+        if self.enabled:
+            try:
+                FRAME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+                LOG.info("Frame log ACTIVO en %s (sesión desde %s)", FRAME_LOG_DIR, self.session_file)
+            except Exception as exc:
+                self.enabled = False
+                LOG.warning("Frame log desactivado — no se pudo crear %s: %s", FRAME_LOG_DIR, exc)
+
+    def _refresh_session(self, now: float) -> None:
+        if now - self._last_session_check < 1.0:
+            return
+        self._last_session_check = now
+        try:
+            label = self.session_file.read_text(encoding="utf-8").strip() if self.session_file.exists() else ""
+        except Exception:
+            label = ""
+        label = "".join(c for c in label if c.isalnum() or c in "-_")[:60] or "auto"
+        if label != self.session_id:
+            LOG.info("Frame log — sesión: %s → %s", self.session_id, label)
+            self.session_id = label
+
+    def _ensure_file(self) -> None:
+        key = (datetime.utcnow().strftime("%Y%m%d"), self.session_id)
+        if key == self._file_key and self._writer is not None:
+            return
+        self._close()
+        path = FRAME_LOG_DIR / f"cam{self.camera_id}_frames_{key[0]}_{key[1]}.csv"
+        new = not path.exists()
+        self._fh = open(path, "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=FRAME_LOG_FIELDS, extrasaction="ignore")
+        if new:
+            self._writer.writeheader()
+        self._file_key = key
+
+    def _close(self) -> None:
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+        self._writer = None
+
+    def write(self, row: Dict[str, object]) -> None:
+        if not self.enabled:
+            return
+        try:
+            now = time.time()
+            self._refresh_session(now)
+            self._ensure_file()
+            row.setdefault("ts_utc", datetime.utcnow().isoformat(timespec="milliseconds"))
+            row["session_id"] = self.session_id
+            self._writer.writerow(row)
+            self._rows += 1
+            if self._rows % 20 == 0:
+                self._fh.flush()
+        except Exception as exc:
+            self._errors += 1
+            if self._errors in (1, 10, 100) or self._errors % 1000 == 0:
+                LOG.warning("Frame log — error #%d (ignorado, detección sigue): %s", self._errors, exc)
+            if self._errors >= 5000:
+                self.enabled = False
+                LOG.warning("Frame log desactivado tras %d errores", self._errors)
+
+    def flush(self) -> None:
+        try:
+            if self._fh:
+                self._fh.flush()
+        except Exception:
+            pass
+
+
+def _frame_stats(detections: List[Dict[str, object]]) -> Dict[str, object]:
+    yolo = [float(d.get("yolo_score") or 0.0) for d in detections]
+    nas = [float(d["nasnet_score"]) for d in detections if d.get("nasnet_score") is not None]
+    return {
+        "n_yolo": len(detections),
+        "max_yolo": round(max(yolo), 4) if yolo else "",
+        "n_cerca_mano": sum(1 for d in detections if d.get("near_hand_arm")),
+        "n_nasnet": len(nas),
+        "max_nasnet": round(max(nas), 4) if nas else "",
+    }
 
 KP_LEFT_SHOULDER  = 5
 KP_RIGHT_SHOULDER = 6
@@ -638,6 +749,7 @@ def main() -> None:
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     LOG.info("Dispositivo inferencia: %s", _device)
     LOG.info("Detección ACTIVA (InsightFace cargando en fondo...)")
+    flog = FrameLogger(CAMERA_ID)
 
     last_alert_time = 0.0
     window_name = "VISORA — Weapon Detection"
@@ -685,6 +797,8 @@ def main() -> None:
                     break
             continue
 
+        _t_frame = time.time()
+        _flog_evt_id = None
         weapon_results = yolo_weapon.predict(
             source=frame_bgr, conf=YOLO_CONF, imgsz=YOLO_IMGSZ, verbose=False, device=_device,
         )
@@ -782,6 +896,7 @@ def main() -> None:
                     _buf_start = now
                     _buf.clear()
                     _pending_event_id, _pending_alert_id = post_weapon_initial(token_ref, tienda_id)
+                    _flog_evt_id = _pending_event_id if _pending_event_id is not None else "409"
                     LOG.info("ARMA CONFIRMADA — confianza=%.0f%% | ventana de captura %.0fs iniciada | evento=#%s alerta=#%s",
                              confidence * 100, CAPTURE_WINDOW, _pending_event_id, _pending_alert_id)
 
@@ -839,6 +954,19 @@ def main() -> None:
                 _save_snapshot(snap, CAMERA_ID)
                 _upload_event_frame(token_ref, _pending_event_id, snap)
                 patch_weapon_result(token_ref, _pending_event_id, _pending_alert_id, best_conf, identity)
+                try:
+                    flog.write({
+                        "tipo": "evento_cierre", "frame_idx": _frame_counter,
+                        "evento_id": _pending_event_id if _pending_event_id is not None else "409",
+                        "conf_evento": round(float(best_conf), 4),
+                        "face_known": "" if not identity else int(bool(identity.get("known"))),
+                        "face_score": "" if not identity else round(float(identity.get("face_score") or 0), 4),
+                        "face_nombre": "TIMEOUT" if not identity else (
+                            identity.get("nombre", "DESCONOCIDO") if identity.get("known") else "DESCONOCIDO"),
+                    })
+                    flog.flush()
+                except Exception:
+                    pass
                 last_alert_time = time.time()
                 _buf.clear()
                 _pending_event_id = None
@@ -851,6 +979,24 @@ def main() -> None:
         else:
             if not HEADLESS:
                 draw_status(frame_bgr, "Sin arma detectada", (0, 255, 0))
+
+        try:
+            _row = _frame_stats(detections)
+            _row.update({
+                "tipo": "frame", "frame_idx": _frame_counter,
+                "proc_ms": round((time.time() - _t_frame) * 1000, 1),
+                "n_confirmados": len(confirmed_detections),
+                "conf_confirmada": round(float(confirmed_detections[0].get("weapon_confidence") or 0), 4)
+                                   if confirmed_detections else "",
+                "pausado": int(PAUSE_FILE.exists()),
+                "cooldown_activo": int(time.time() - last_alert_time < ALERT_COOLDOWN),
+                "buffering": int(_buffering),
+                "evento_disparado": int(_flog_evt_id is not None),
+                "evento_id": "" if _flog_evt_id is None else _flog_evt_id,
+            })
+            flog.write(_row)
+        except Exception:
+            pass
 
         if not HEADLESS:
             cv2.imshow(window_name, frame_bgr)
